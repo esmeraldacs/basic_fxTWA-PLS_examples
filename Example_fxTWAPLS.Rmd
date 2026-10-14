@@ -1,0 +1,178 @@
+---
+title: "Reconstruction"
+output: html_document
+date: "2026-07-01"
+---
+
+#TWA-PLS Calibration and Validation of Tree Cover from Modern Pollen
+
+Following Liu et al. (2020), this workflow applies tolerance-weighted WA-PLS with fx correction to calibrate the relationship between modern pollen assemblages and tree cover. Predictive performance is assessed using pseudo-site-excluded cross-validation, which removes geographically and environmentally similar sites from each training set.
+
+Liu, M., Prentice, I. C., ter Braak, C. J. F., & Harrison, S. P. (2020). “An improved statistical approach for reconstructing past climates from biotic assemblages.” Proceedings of the Royal Society A, 476(2243), 20200346. https://doi.org/10.1098/rspa.2020.0346
+
+##Libraries
+```{r}
+#You can install the released version of fxTWAPLS from CRAN with:
+#install.packages("fxTWAPLS")
+library(tidyverse)
+library(foreach)
+```
+
+##Preparing the modern pollen data for model fitting
+
+Import the dataset of the pollen percentages with the values of tree cover using different buffers
+```{r}
+CPUS <- 8 #To define the number of CPUs to use in the cross-validation
+
+#Data in proportions or percentages
+europe_extraction <- read_csv("Input/EUROP_tree_extraction_and_pollen_modern.csv") 
+
+#For example purposes intiially working only with a small sample of the dataset
+set.seed(9751)
+europe_extraction <- sample_n(europe_extraction, size = 400)
+```
+
+
+
+This code groups the European extraction data by location and calculates the mean of each numeric variable for records with the same latitude and longitude, ignoring missing values. It then adds a unique sample ID as the first column. A second object, taxa_europe, is created with the taxa columns needed as predictors for the model, leaving out the sample ID and site or environmental variables.
+```{r}
+# Average numeric variables for records at the same location.
+# Keep the sample ID and entity name out of the summary.
+modern_europe <- europe_extraction |>
+  dplyr::group_by(latitude, longitude) |>
+  dplyr::summarise(
+    dplyr::across(
+      where(is.numeric),
+      \(x) mean(x, na.rm = TRUE)
+      ), .groups = "drop") |>
+  dplyr::mutate(id_sample = paste0("ID_", dplyr::row_number()), .before = 1)
+
+# Select only the pollen taxa to use as model predictors.
+# Exclude site information and the target variable.
+taxa_europe <- modern_europe |>
+  dplyr::select(-id_sample, -latitude, -longitude, -elevation, -hill_n2, -Tree_Buffer_24km)
+
+# Remove taxa columns that contain only missing values or are constant.
+taxa_europe <- taxa_europe |>
+  dplyr::select(where(\(x) any(!is.na(x))),
+                where(\(x) dplyr::n_distinct(x, na.rm = TRUE) > 1))
+
+# Retain only samples with complete predictor and target data.
+complete_samples <- stats::complete.cases(taxa_europe, modern_europe$Tree_Buffer_24km)
+taxa_europe <- taxa_europe[complete_samples, ]
+modern_europe <- modern_europe[complete_samples, ]
+```
+
+
+##Model Fitting and Spatial Cross-Validation Setup
+
+This chunk trains a TWA-PLS model to estimate tree cover from modern pollen taxa. The taxa abundances are used as predictors, and Tree_Buffer_24km is the target variable. The model extracts up to five PLS components and applies the fx correction using a P-spline method. The fitted model is stored in fit_tf_tree_europe for subsequent use.
+```{r, warning=F}
+fit_tf_tree_europe <- fxTWAPLS::TWAPLS.w2(taxa_europe, modern_europe$Tree_Buffer_24km, nPLS = 5, usefx = TRUE, fx_method="pspline",bin=0.005)
+```
+
+
+
+This code extracts the longitude and latitude of each modern sample and calculates the pairwise distances between all sites using the Haversine formula. The resulting distance matrix is used in the subsequent pseudo-site selection step for spatially informed cross-validation. The calculation is run in parallel using up to eight CPU cores.
+```{r}
+# Get the location information of each sample
+point_europe <- modern_europe[, c("longitude", "latitude")]
+# Get the distance between each point
+dist_europe <- fxTWAPLS::get_distance(point_europe, cpus = CPUS)
+```
+
+
+This chunk identifies, for each sample, the other sites that are both geographically and environmentally similar. A site is considered similar if it is within 50 km and its `Tree_Buffer_24km` value differs by less than 2% of the full range of that variable. These groups of nearby, similar sites are stored in `pseudo_tree_latam` and `pseudo_tree_europe` and can be excluded during cross-validation to reduce the risk of overly optimistic performance estimates caused by spatially clustered samples
+```{r}
+pseudo_tree_europe <- fxTWAPLS::get_pseudo(dist_europe, modern_europe$Tree_Buffer_24km, cpus = CPUS)
+```
+
+
+#Cross-Validation 
+
+This chunk evaluates the model using pseudo-site-excluded leave-one-out cross-validation. For each sample, it excludes that sample and its nearby, environmentally similar sites from the training data, trains the TWA-PLS model on the remaining samples, and predicts the excluded sample. The procedure is repeated across all samples, producing predictions for up to five PLS components. The progress bar tracks the cross-validation run.
+```{r, warning=FALSE}
+# Leave-out cross validation
+cv_tf2_tree_europe_pspline <- fxTWAPLS::cv.pr.w(taxa_europe,
+                                         modern_europe$Tree_Buffer_24km,
+                                         nPLS = 5,
+                                         fxTWAPLS::TWAPLS.w2,
+                                         fxTWAPLS::TWAPLS.predict.w,
+                                         pseudo_tree_europe,
+                                         usefx = TRUE,
+                                         fx_method = "pspline",
+                                         bin = 0.005,
+                                         cpus = CPUS,
+                                         test_mode = FALSE)  %>% fxTWAPLS::pb()  
+
+#write.csv(cv_tf2_tree_europe_pspline, paste0(my_path,"cv_tf2_tree_europe_pspline.csv"))
+```
+
+#Model Performance Assessment
+
+This chunk evaluates the cross-validation results using a randomisation test with 999 permutations. It calculates performance statistics for each number of PLS components, including prediction error and explained variance, and assesses whether adding another component significantly improves the model. The results are converted to a tibble, then labelled with the response variable (tree_fr) and the corresponding number of components.
+```{r}
+component_numbers <- colnames(cv_tf2_tree_europe_pspline)[-1] 
+
+# Random t test to the cross validation result
+rand_tf2_tree_europe_pspline <- fxTWAPLS::rand.t.test.w(cv_tf2_tree_europe_pspline, n.perm = 999) |>
+  tibble::as_tibble() |>
+  dplyr::mutate(variable = "tree_fr", n_comp = component_numbers, .before = 1)
+```
+
+The first chunk filters the cross-validation results to retain components with p < 0.01, then selects the one with the lowest RMSEP. The second extracts its component number into best_comp_tree_europe, which can be used when selecting predictions from the cross-validation or model output.
+```{r}
+best_comps_europe <- rand_tf2_tree_europe_pspline |>
+  dplyr::filter(p < 0.01) |>
+  dplyr::slice_min(RMSEP, with_ties = FALSE)
+
+best_comp_tree_europe <- best_comps_europe |>
+  dplyr::pull(n_comp)
+
+ob_pred_tree_europe <- data.frame(
+  Observed = cv_tf2_tree_europe_pspline$test.x,
+  Predicted = cv_tf2_tree_europe_pspline[[best_comp_tree_europe]] ) |>
+  dplyr::mutate(variable = "tree")
+
+
+ob_pred_tree_europe <- dplyr::bind_cols(modern_europe |>
+    dplyr::select(id_sample, latitude, longitude), ob_pred_tree_europe)
+```
+
+
+
+Plotting observed vs predicted
+
+```{r}
+# 1. Crear gráficos individuales para cada variable
+ggplot(ob_pred_tree_europe, aes(x = Observed, y = Predicted)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  geom_smooth(method = "lm", se = TRUE, color = "red", linewidth = 0.5) +
+  coord_fixed(ratio = 1) +  # Cuadrado perfecto
+  labs(title = "Europe") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+```
+
+
+
+```{r}
+ggplot(ob_pred_tree_europe, aes(x = longitude, y = latitude)) +
+  borders("world", colour = "grey70") +
+  geom_point(aes(colour = Observed)) +
+  coord_quickmap(xlim = range(ob_pred_tree_europe$longitude, na.rm = TRUE),
+                 ylim = range(ob_pred_tree_europe$latitude, na.rm = TRUE)) +
+  labs(subtitle = "Observed values")
+
+ggplot(ob_pred_tree_europe, aes(x = longitude, y = latitude)) +
+  borders("world", colour = "grey70") +
+  geom_point(aes(colour = Predicted)) +
+  coord_quickmap(xlim = range(ob_pred_tree_europe$longitude, na.rm = TRUE),
+                 ylim = range(ob_pred_tree_europe$latitude, na.rm = TRUE)) +
+  labs(subtitle = "Predicted values")
+```
+
+
+
+
